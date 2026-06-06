@@ -1,0 +1,22 @@
+combo,mean_kappa,mean_acc,weak_kappa,strong_kappa,a05_kappa,n_bases,weights
+Faz1 sLDA tek başina (referans),0.625,,0.4074,0.7991,0.3287,1,—
+FBCSP+sLDA + MB-TS-PCA (esit),0.6399,0.7299,0.4329,0.8056,0.3611,2,equal
+FBCSP+sLDA + MB-TS-L1 (esit) [Faz4 lider],0.6425,0.7319,0.4155,0.8241,0.3287,2,equal
+FBCSP+sLDA + MB-TS-PCA + MB-TS-L1 (esit),0.6379,0.7284,0.4062,0.8231,0.3241,3,equal
+4 klasik base (esit),0.6348,0.7261,0.4062,0.8176,0.3009,4,equal
+"Faz4-lider + EEGNet (esit, 3-lu)",0.6466,0.735,0.4178,0.8296,0.3148,3,equal
+FBCSP+sLDA + EEGNet (esit),0.6348,0.7261,0.4097,0.8148,0.3287,2,equal
+"Faz4-lider + ShallowConvNet (esit, 3-lu)",0.643,0.7323,0.4201,0.8213,0.338,3,equal
+FBCSP+sLDA + ShallowConvNet (esit),0.6327,0.7245,0.412,0.8093,0.3426,2,equal
+"Faz4-lider + EEGNet + ShallowConvNet (esit, 4-lu)",0.6451,0.7338,0.4259,0.8204,0.3519,4,equal
+Tum 6 base (esit),0.643,0.7323,0.4549,0.7935,0.3102,8,equal
+Faz4-lider + EEGNet + ShallowConvNet (1/1/0.5/0.5),0.6553,0.7415,0.4329,0.8333,0.338,4,"[1.0, 1.0, 0.5, 0.5]"
+Faz4-lider + EEGNet + ShallowConvNet (1.5/1/0.5/0.5),0.6471,0.7353,0.4248,0.825,0.3426,4,"[1.5, 1.0, 0.5, 0.5]"
+Faz4-lider + EEGNet + ShallowConvNet (1/1/0.3/0.3),0.6466,0.735,0.419,0.8287,0.3287,4,"[1.0, 1.0, 0.3, 0.3]"
+"Faz4-lider + EEGNet-transfer (esit, 3-lu)",0.6394,0.7296,0.4155,0.8185,0.3009,3,equal
+"Faz4-lider + ShallowConvNet-transfer (esit, 3-lu)",0.6415,0.7311,0.4201,0.8185,0.2824,3,equal
+Faz4-lider + EEGNet-tr + ShallowConvNet-tr (1/1/0.5/0.5),0.6507,0.738,0.434,0.8241,0.3148,4,"[1.0, 1.0, 0.5, 0.5]"
+"Faz4-lider + EEGNet-tr + ShallowConvNet-tr (esit, 4-lu)",0.6548,0.7411,0.441,0.8259,0.3194,4,equal
+Faz4-lider + 2 subj-DL + 2 transfer-DL (1/1/0.5/0.5/0.5/0.5),0.6538,0.7404,0.4329,0.8306,0.3102,6,"[1.0, 1.0, 0.5, 0.5, 0.5, 0.5]"
+Tüm 8 base (esit),0.643,0.7323,0.4549,0.7935,0.3102,8,equal
+Faz4-lider + 4 DL (1/1/0.3/0.3/0.3/0.3),0.6543,0.7407,0.4306,0.8333,0.3241,6,"[1.0, 1.0, 0.3, 0.3, 0.3, 0.3]"
