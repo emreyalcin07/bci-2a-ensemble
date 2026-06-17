@@ -50,6 +50,10 @@ BASE_DIRS = {
     "shallowconvnet":           "Faz5a: ShallowConvNet",
     "eegnet_transfer":          "Faz5b: EEGNet LOSO transfer",
     "shallowconvnet_transfer":  "Faz5b: ShallowConvNet LOSO transfer",
+    "atcnet":                   "Faz6: ATCNet (pre-norm)",
+    "eegnet_10seed":            "Faz11: EEGNet 10-seed",
+    "shallowconvnet_10seed":    "Faz11: ShallowConvNet 10-seed",
+    "atcnet_10seed":            "Faz11: ATCNet 10-seed",
 }
 
 WEAK_SUBJECTS = {2, 4, 5, 6}
@@ -126,6 +130,95 @@ def evaluate_combo(
                 y_ref = y_true
             probas.append(y_proba)
         y_pred = soft_vote(probas, weights)
+        rows.append({
+            "subject": sid,
+            "kappa": cohen_kappa_score(y_ref, y_pred),
+            "acc": accuracy_score(y_ref, y_pred),
+            "macro_f1": f1_score(y_ref, y_pred, average="macro"),
+        })
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
+# Faz 9: Dynamic (confidence-weighted) soft voting                            #
+# --------------------------------------------------------------------------- #
+
+
+def dynamic_soft_vote(
+    proba_list: Sequence[np.ndarray],
+    global_weights: Optional[Sequence[float]] = None,
+    temperature: float = 1.0,
+) -> np.ndarray:
+    """Hybrid dynamic combination: global × per-trial confidence.
+
+    Her trial için her base'in confidence skoru = negatif entropy.
+    Per-trial weight = softmax(confidence / temperature) — temperature
+    keskinligi kontrol eder.
+
+    Final weight = global_weight × per_trial_weight (normalized).
+
+    Args:
+        proba_list: List of (n_trials, n_classes) probability matrices.
+        global_weights: Per-base global weights (len = n_bases). None ise esit.
+        temperature: T=0 limit en guvenli base hard-selection; T=inf esit
+                     soft voting. Default T=1.0.
+
+    Returns:
+        Predicted labels (n_trials,).
+    """
+    n_bases = len(proba_list)
+    if global_weights is None:
+        gw = np.ones(n_bases) / n_bases
+    else:
+        gw = np.asarray(global_weights, dtype=np.float64)
+        gw = gw / gw.sum()
+
+    stacked = np.stack(proba_list, axis=0)  # (n_bases, n_trials, n_classes)
+
+    # Per-trial confidence: negatif entropy (yuksek = guvenli)
+    eps = 1e-12
+    log_probs = np.log(stacked + eps)
+    entropy = -np.sum(stacked * log_probs, axis=2)  # (n_bases, n_trials)
+    confidence = -entropy  # daha yuksek = daha guvenli
+
+    # Per-trial weight: softmax(confidence / T) across bases
+    if temperature <= 0:
+        # T=0 limit: hard selection of most confident base
+        per_trial_w = np.zeros_like(confidence)
+        best = confidence.argmax(axis=0)
+        per_trial_w[best, np.arange(confidence.shape[1])] = 1.0
+    else:
+        scaled = confidence / temperature
+        # Numerical stability: subtract max
+        scaled = scaled - scaled.max(axis=0, keepdims=True)
+        exp_scaled = np.exp(scaled)
+        per_trial_w = exp_scaled / exp_scaled.sum(axis=0, keepdims=True)
+
+    # Combine: global * per_trial, normalize per trial
+    combined_w = gw[:, np.newaxis] * per_trial_w  # (n_bases, n_trials)
+    combined_w = combined_w / combined_w.sum(axis=0, keepdims=True)
+
+    # Weighted average of probabilities
+    avg = np.einsum("bt,btc->tc", combined_w, stacked)
+    return avg.argmax(axis=1)
+
+
+def evaluate_combo_dynamic(
+    bases: Sequence[str],
+    global_weights: Optional[Sequence[float]] = None,
+    temperature: float = 1.0,
+) -> pd.DataFrame:
+    """Dynamic combination ile her denek icin sonuc DataFrame'i."""
+    rows = []
+    for sid in ALL_SUBJECTS:
+        y_ref = None
+        probas = []
+        for base in bases:
+            y_true, y_proba = load_oof(base, sid)
+            if y_ref is None:
+                y_ref = y_true
+            probas.append(y_proba)
+        y_pred = dynamic_soft_vote(probas, global_weights, temperature)
         rows.append({
             "subject": sid,
             "kappa": cohen_kappa_score(y_ref, y_pred),
@@ -310,6 +403,67 @@ def main():
                 w_lower,
             ))
 
+    # ===== Faz 6: ATCNet kombinasyonlari =====
+    if "atcnet" in bases_all:
+        combos.append((
+            "Faz4-lider + ATCNet (esit, 3-lu)",
+            BEST_CLASSIC + ["atcnet"], None,
+        ))
+        combos.append((
+            "Faz4-lider + ATCNet (1/1/0.5)",
+            BEST_CLASSIC + ["atcnet"], [1.0, 1.0, 0.5],
+        ))
+        # Onceki lider (Faz4-lider + EEGNet + ShallowConvNet 1/1/0.5/0.5) ile
+        # tam karsilastirma: ATCNet'i 5. base olarak ekle
+        if "eegnet" in bases_all and "shallowconvnet" in bases_all:
+            combos.append((
+                "Faz4-lider + EEGNet + ShallowConvNet + ATCNet (1/1/0.5/0.5/0.5)",
+                BEST_CLASSIC + ["eegnet", "shallowconvnet", "atcnet"],
+                [1.0, 1.0, 0.5, 0.5, 0.5],
+            ))
+            combos.append((
+                "Faz4-lider + EEGNet + ShallowConvNet + ATCNet (1/1/0.5/0.5/0.3)",
+                BEST_CLASSIC + ["eegnet", "shallowconvnet", "atcnet"],
+                [1.0, 1.0, 0.5, 0.5, 0.3],
+            ))
+
+    # ===== Faz 11: 10-seed DL kombinasyonlari =====
+    if all(b in bases_all for b in ["eegnet_10seed", "shallowconvnet_10seed"]):
+        # 2 DL_10s — agirlik ablation (eski lider 1/1/0.5/0.5 idi, simdi yukseltiyoruz)
+        for w in [0.5, 0.7, 1.0]:
+            combos.append((
+                f"Faz4 + EEGNet_10s + Shallow_10s (1/1/{w}/{w})",
+                BEST_CLASSIC + ["eegnet_10seed", "shallowconvnet_10seed"],
+                [1.0, 1.0, w, w],
+            ))
+        # Asimetrik: EEGNet daha yuksek (+0.080 > Shallow +0.038)
+        combos.append((
+            "Faz4 + EEGNet_10s + Shallow_10s (1/1/1.0/0.7) asymmetric",
+            BEST_CLASSIC + ["eegnet_10seed", "shallowconvnet_10seed"],
+            [1.0, 1.0, 1.0, 0.7],
+        ))
+
+        # 3 DL_10s ekli varyantlar
+        if "atcnet_10seed" in bases_all:
+            for w in [0.5, 0.7, 1.0]:
+                combos.append((
+                    f"Faz4 + EEGNet_10s + Shallow_10s + ATCNet_10s (1/1/{w}/{w}/{w})",
+                    BEST_CLASSIC + ["eegnet_10seed", "shallowconvnet_10seed", "atcnet_10seed"],
+                    [1.0, 1.0, w, w, w],
+                ))
+            # Asimetrik: EEGNet ve ATCNet esit yuksek (+0.080 ikisi de), Shallow daha dusuk (+0.038)
+            combos.append((
+                "Faz4 + EEGNet_10s + Shallow_10s + ATCNet_10s (1/1/1.0/0.7/1.0)",
+                BEST_CLASSIC + ["eegnet_10seed", "shallowconvnet_10seed", "atcnet_10seed"],
+                [1.0, 1.0, 1.0, 0.7, 1.0],
+            ))
+            # Tek basina FBCSP + 3 DL_10s (Riemann olmadan)
+            combos.append((
+                "FBCSP + 3 DL_10s (1/1/1/1)",
+                ["fbcsp_rlda", "eegnet_10seed", "shallowconvnet_10seed", "atcnet_10seed"],
+                [1.0, 1.0, 1.0, 1.0],
+            ))
+
     # 5. Cozumle ve tabloyu olustur
     summary_rows = []
     per_subject_table = pd.DataFrame({"subject": ALL_SUBJECTS}).set_index("subject")
@@ -330,6 +484,45 @@ def main():
             "a05_kappa":  round(a05, 4),
             "n_bases": len(bases),
             "weights": str(weights) if weights else "equal",
+        })
+        per_subject_table[name] = df.set_index("subject")["kappa"].values.round(4)
+
+    # ===== Faz 9: Dynamic combination =====
+    DYNAMIC_BASES_5 = BEST_CLASSIC + ["eegnet", "shallowconvnet", "atcnet"]
+    DYNAMIC_WEIGHTS_5 = [1.0, 1.0, 0.5, 0.5, 0.5]
+    DYNAMIC_BASES_4 = BEST_CLASSIC + ["eegnet", "shallowconvnet"]
+    DYNAMIC_WEIGHTS_4 = [1.0, 1.0, 0.5, 0.5]
+
+    dynamic_combos = []
+    if all(b in bases_all for b in DYNAMIC_BASES_5):
+        for T in [0.5, 1.0, 2.0, 5.0]:
+            dynamic_combos.append((
+                f"DYNAMIC 5-base (1/1/0.5/0.5/0.5) T={T}",
+                DYNAMIC_BASES_5, DYNAMIC_WEIGHTS_5, T,
+            ))
+    if all(b in bases_all for b in DYNAMIC_BASES_4):
+        for T in [0.5, 1.0, 2.0, 5.0]:
+            dynamic_combos.append((
+                f"DYNAMIC 4-base (1/1/0.5/0.5) T={T}",
+                DYNAMIC_BASES_4, DYNAMIC_WEIGHTS_4, T,
+            ))
+
+    for name, bases, weights, T in dynamic_combos:
+        df = evaluate_combo_dynamic(bases, weights, T)
+        mean_k = df["kappa"].mean()
+        mean_a = df["acc"].mean()
+        weak_k = df[df["subject"].isin(WEAK_SUBJECTS)]["kappa"].mean()
+        strong_k = df[~df["subject"].isin(WEAK_SUBJECTS)]["kappa"].mean()
+        a05 = float(df[df["subject"] == 5]["kappa"].iloc[0])
+        summary_rows.append({
+            "combo": name,
+            "mean_kappa": round(mean_k, 4),
+            "mean_acc": round(mean_a, 4),
+            "weak_kappa": round(weak_k, 4),
+            "strong_kappa": round(strong_k, 4),
+            "a05_kappa": round(a05, 4),
+            "n_bases": len(bases),
+            "weights": f"{weights} | T={T}",
         })
         per_subject_table[name] = df.set_index("subject")["kappa"].values.round(4)
 

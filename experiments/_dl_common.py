@@ -143,6 +143,51 @@ class EEGDataset(Dataset):
 
 
 # --------------------------------------------------------------------------- #
+# S&R (Segmentation & Reconstruction) augmentation                            #
+# --------------------------------------------------------------------------- #
+
+
+def _segmentation_reconstruction(X, y, n_segments=4, n_aug_per_trial=4, seed=42):
+    """S&R augmentation (Lotte 2014, Conformer 2022).
+    Her trial zaman ekseninde n_segments parcaya bolunur, ayni siniftan
+    farkli trial'larin segmentleri rastgele birlestirilir.
+
+    Args:
+        X: (N, C, T) — egitim verisi
+        y: (N,) — etiketler
+    Returns:
+        X_aug: (N + N*n_aug_per_trial, C, T)
+        y_aug: ayni boyutta
+    SADECE TRAIN FOLD'a uygulanmali. Val/test'e DOKUNMA.
+    """
+    rng = np.random.RandomState(seed)
+    N, C, T = X.shape
+    seg_len = T // n_segments
+
+    X_aug_list = [X]
+    y_aug_list = [y]
+
+    for cls in np.unique(y):
+        idx_cls = np.where(y == cls)[0]
+        if len(idx_cls) < 2:
+            continue
+        for _ in range(len(idx_cls) * n_aug_per_trial):
+            new_trial = np.zeros((C, T), dtype=X.dtype)
+            for s in range(n_segments):
+                src = rng.choice(idx_cls)
+                a = s * seg_len
+                b = a + seg_len if s < n_segments - 1 else T
+                new_trial[:, a:b] = X[src, :, a:b]
+            X_aug_list.append(new_trial[np.newaxis])
+            y_aug_list.append(np.array([cls]))
+
+    X_comb = np.concatenate(X_aug_list, axis=0)
+    y_comb = np.concatenate(y_aug_list, axis=0)
+    perm = rng.permutation(len(y_comb))
+    return X_comb[perm], y_comb[perm]
+
+
+# --------------------------------------------------------------------------- #
 # Train one fold (with early stopping)                                        #
 # --------------------------------------------------------------------------- #
 
@@ -159,6 +204,11 @@ class TrainConfig:
     shift_max: int = 12
     noise_std: float = 0.1
     verbose: bool = False
+    # --- S&R augmentation (Faz 8) — geri uyumlu, default mevcut davranis ---
+    augment_mode: str = "standard"  # "standard" (shift+noise), "sr" (S&R),
+                                    # veya "both" (S&R sonra shift+noise)
+    sr_n_segments: int = 4          # S&R segment sayisi (4 -> 0.5s segment)
+    sr_n_aug_per_trial: int = 4     # her gercek trial icin kac sentetik
 
 
 def _stratified_inner_split(
@@ -195,8 +245,22 @@ def train_one_fold(
     X_tr, y_tr = X_tr_outer[tr_idx], y_tr_outer[tr_idx]
     X_va, y_va = X_tr_outer[va_idx], y_tr_outer[va_idx]
 
+    # S&R augmentation (sadece TRAIN fold'a; val/test'e ASLA)
+    if getattr(cfg, "augment_mode", "standard") in ("sr", "both"):
+        X_tr, y_tr = _segmentation_reconstruction(
+            X_tr, y_tr,
+            n_segments=cfg.sr_n_segments,
+            n_aug_per_trial=cfg.sr_n_aug_per_trial,
+            seed=inner_seed,
+        )
+
+    # standard -> shift+noise (mevcut davranis); both -> S&R + shift+noise;
+    # sr -> sadece S&R (per-sample shift/noise kapali)
+    _mode = getattr(cfg, "augment_mode", "standard")
+    ds_tr_augment = (_mode in ("standard", "both")) and cfg.augment
+
     # Datasets
-    ds_tr = EEGDataset(X_tr, y_tr, augment=cfg.augment,
+    ds_tr = EEGDataset(X_tr, y_tr, augment=ds_tr_augment,
                        shift_max=cfg.shift_max, noise_std=cfg.noise_std)
     ds_va = EEGDataset(X_va, y_va, augment=False)
     ds_te = EEGDataset(X_te_outer, np.zeros(len(X_te_outer), dtype=np.int64), augment=False)
@@ -367,6 +431,128 @@ def run_dl_subject(
         n_trials=n,
         elapsed_sec=elapsed,
         best_params_per_fold=fold_info,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Multi-seed averaging (Faz 10)                                               #
+# --------------------------------------------------------------------------- #
+
+
+def run_dl_subject_multiseed(
+    subject_id: int,
+    model_factory: Callable[[], nn.Module],
+    cfg: TrainConfig,
+    oof_subdir: str,
+    n_seeds: int = 10,
+    outer_splits: int = 5,
+    verbose: bool = True,
+) -> SubjectRunResult:
+    """Multi-seed averaging: ayni denek icin n_seeds farkli seed ile egit,
+    OOF olasilik matrislerini ortalama al, NIHAI OOF kaydet.
+
+    KRITIK tasarim: run_dl_subject'i tekrar tekrar cagirmak ise YARAMAZ cunku
+    train_one_fold icinde inner_seed = RANDOM_STATE + fi SABIT — global set_seed'i
+    ezdigi icin tum seed'ler bit-bit ayni cikti uretirdi. Bu yuzden burada outer
+    fold dongusunu (ayni StratifiedKFold random_state=42) kendimiz kurup
+    train_one_fold'a SEED-BAGIMLI inner_seed geciyoruz:
+        inner_seed = RANDOM_STATE + s_idx * 100 + fi
+    Boylece outer fold yapisi (ensemble hizalamasi icin) DEGISMEZ, sadece model
+    init / dropout / augmentation stokastisitesi seed basina degisir.
+
+    Reproducibility: seed indexleri 0..n_seeds-1; her seed icin 5 fold.
+    """
+    t0 = time.time()
+    sd = load_subject(subject_id=subject_id, session="T", verbose=False)
+    if sd.y is None:
+        raise RuntimeError(f"A{subject_id:02d}T icin etiket yok.")
+
+    # Wide bandpass + uV olcek (run_dl_subject ile birebir ayni on-isleme)
+    X = bandpass_wide(sd.X, sd.sfreq) * 1e6  # (N, C, T)
+    y = sd.y
+    n = len(y)
+    n_classes = int(np.max(y) + 1)
+
+    if verbose:
+        print(
+            f"[A{subject_id:02d}T] X={X.shape}, y={y.shape}, device={DEVICE}, "
+            f"n_seeds={n_seeds}",
+            flush=True,
+        )
+
+    # Outer fold yapisi — TUM seed'lerde ayni (klasik fazlarla bit-bit ayni)
+    skf = StratifiedKFold(n_splits=outer_splits, shuffle=True, random_state=RANDOM_STATE)
+    folds = list(skf.split(X, y))
+
+    # Seed basina OOF proba uretip ortalamaya ekle
+    proba_accum = np.zeros((n, n_classes), dtype=np.float64)
+    seed_kappas: List[float] = []
+
+    for s_idx in range(n_seeds):
+        oof_proba_seed = np.zeros((n, n_classes), dtype=np.float64)
+        oof_pred_seed = np.full(n, -1, dtype=np.int64)
+        for fi, (tr, te) in enumerate(folds):
+            inner_seed = RANDOM_STATE + s_idx * 100 + fi  # seed-bagimli
+            y_proba_te, _info = train_one_fold(
+                model_factory=model_factory,
+                X_tr_outer=X[tr], y_tr_outer=y[tr],
+                X_te_outer=X[te],
+                cfg=cfg,
+                inner_seed=inner_seed,
+            )
+            oof_proba_seed[te] = y_proba_te
+            oof_pred_seed[te] = y_proba_te.argmax(axis=1)
+
+        k_seed = cohen_kappa_score(y, oof_pred_seed)
+        seed_kappas.append(k_seed)
+        proba_accum += oof_proba_seed
+        if verbose:
+            seed_val = RANDOM_STATE + s_idx
+            print(
+                f"  [seed_idx {s_idx} (base {seed_val})] kappa={k_seed:.4f}  "
+                f"elapsed_so_far={time.time()-t0:.0f}s",
+                flush=True,
+            )
+
+    # Ortalama olasilik -> argmax
+    proba_mean = (proba_accum / n_seeds).astype(np.float32)
+    pred_mean = proba_mean.argmax(axis=1)
+
+    kappa = cohen_kappa_score(y, pred_mean)
+    acc = accuracy_score(y, pred_mean)
+    mf1 = f1_score(y, pred_mean, average="macro")
+
+    # Nihai OOF kaydet (klasik base'lerle ayni format)
+    oof_dir = OOF_ROOT / oof_subdir
+    oof_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        oof_dir / f"sub_{subject_id:02d}.npz",
+        y_true=y,
+        y_pred=pred_mean,
+        y_proba=proba_mean,
+    )
+
+    elapsed = time.time() - t0
+    if verbose:
+        print(
+            f"[A{subject_id:02d}T] MULTISEED({n_seeds}) kappa={kappa:.4f}  "
+            f"single-seed mean={np.mean(seed_kappas):.4f}  "
+            f"single-seed std={np.std(seed_kappas):.4f}  "
+            f"acc={acc:.4f}  elapsed={elapsed:.1f}s",
+            flush=True,
+        )
+
+    return SubjectRunResult(
+        subject_id=subject_id,
+        kappa=kappa,
+        accuracy=acc,
+        macro_f1=mf1,
+        kappa_std=float(np.std(seed_kappas)),  # seed varyansi
+        n_trials=n,
+        elapsed_sec=elapsed,
+        best_params_per_fold=[
+            {"seed_idx": s, "kappa": k} for s, k in enumerate(seed_kappas)
+        ],
     )
 
 
@@ -710,6 +896,7 @@ __all__ = [
     "bandpass_wide",
     "report_and_save",
     "run_dl_subject",
+    "run_dl_subject_multiseed",
     "run_transfer_subject",
     "set_seed",
     "train_one_fold",

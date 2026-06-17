@@ -702,4 +702,286 @@ DL ~10s/denek (GPU). FBCSP en yavaş (124-220s/denek).
 
 ---
 
-*Son güncelleme: 2026-05-25 (Faz 6 tamamlandı; A0XE Test κ=0.6137, +0.045 vs yarışma kazananı)*
+## Faz 7 — ATCNet Ablation (Negatif/Nötr Sonuç)
+
+> Not: Bu çalışma kronolojik olarak final A0XE değerlendirmesinden (Faz 6) sonra
+> yapıldığı ve numara çakışmasını önlemek için "Faz 7" olarak etiketlenmiştir.
+> Final lider sistemini değiştirmemiştir.
+
+**Hedef**: Mevcut DL base'lerini (EEGNet 0.398, ShallowConvNet 0.397) modern
+attention-based ATCNet (Altaheri 2022) ile değiştirerek ensemble κ'sını artırmak.
+Beklenti: literatürde 2a için raporlanan κ≈0.748 (Train-Val-Test protokolünde).
+
+**Uygulama**:
+
+- Framework: `experiments/_dl_common.py` kullanıldı; mevcut DL base'leri ile birebir
+  aynı preprocessing (bandpass 4–38 Hz, µV scaling), aynı augmentation
+  (time_shift+noise), aynı optimizer (AdamW lr=1e-3 wd=1e-2), aynı 5-fold
+  StratifiedKFold(random_state=42).
+- Mimari: ATCNet PyTorch reimplementation (paper'dan; resmi TF repo'dan port
+  edilmedi). Conv+attention+TCN hibridi, sliding window mantığı, 67K parametre.
+  Tek protokol farkı: bizde T=500 (0.5–2.5 s @ 250 Hz), paper'da T=1125.
+
+**Sonuç (9-denek CV OOF)**:
+
+| Metrik | ATCNet κ |
+|:--|:-:|
+| MEAN | 0.4064 (literatür beklentisi 0.748) |
+| WEAK (A02,A04,A05,A06) | 0.1111 |
+| STRONG (A01,A03,A07,A08,A09) | 0.6426 |
+
+EEGNet (0.398) ve ShallowConvNet (0.397) ile aynı seviyede.
+
+**Ablation HP testleri**:
+
+1. `weight_decay` 1e-2 vs 1e-4 (A01+A03): Δκ ~0, mevcut wd optimal.
+2. Augmentation on/off (A01): Δκ = +0.028 augmentation lehine, tutuldu.
+3. Post-norm vs pre-norm attention (audit'ten geldi): pre-norm A01 weak fold'unda
+   +0.046, ama 9-denek mean'de +0.007 (gürültü). Mimari olarak doğru tedavi (resmi
+   paper pre-norm kullanıyor) ama performans-nötr.
+4. Sığ TCN vs derin TCN: derin TCN (109K param) A03'te overfit (−0.032), geri alındı.
+
+**Cross-base error overlap (Jaccard)**:
+
+| Çift | Jaccard | Yorum |
+|:--|:-:|:--|
+| ATCNet ↔ EEGNet | 0.525 | yüksek örtüşme, ortogonal bilgi yok |
+| ATCNet ↔ ShallowConvNet | 0.514 | yüksek örtüşme |
+| ATCNet ↔ FBCSP+sLDA | 0.356 | DL-klasik beklenen ortogonallık |
+| ATCNet ↔ Riemannian-L1 | 0.402 | orta |
+
+**Ensemble entegrasyon testi**:
+
+| Kombinasyon | κ_CV | Δ vs lider |
+|:--|:-:|:-:|
+| Mevcut lider (Faz4 + EEGNet + ShallowConvNet, 1/1/0.5/0.5) | **0.6553** | — |
+| + ATCNet (1/1/0.5/0.5/0.5) | 0.6528 | −0.0025 |
+| + ATCNet düşük ağırlık (1/1/0.5/0.5/0.3) | 0.6523 | −0.0030 |
+| Faz4 + ATCNet (tek DL, 1/1/0.5) | 0.6363 | −0.0190 |
+
+ATCNet hiçbir kombinasyonda lider yaratmadı.
+
+**Sonuç**: ATCNet bu protokolde (288-trial subject-specific, 5-fold inner CV)
+EEGNet'in taşıdığı bilgiye anlamlı bir ek bilgi getirmedi. Bireysel performans
+eşdeğer, hata profili %50+ örtüşüyor, ensemble'a entegre edildiğinde lider κ
+değişmedi veya hafifçe düştü.
+
+**Yorum**:
+
+- Literatürdeki ATCNet κ≈0.748 raporu farklı protokolden (Session 1 train +
+  Session 2 test, ~288+288 örneklem) geliyor. Bizim protokol her fold'da ~230 trial
+  subject-specific eğitim sağlıyor — modern attention modelleri için yetersiz.
+- Weak grup çöküşü mimari değil veri kaynaklı: pre-norm + derin TCN ile bile A02
+  fold2, A05 fold1, A06 fold4 chance-level'da kaldı (best_epoch=0).
+- ATCNet'in literatür sayıları ile gerçek protokol sayıları arasındaki bu fark,
+  makalede "leakage-free MI-BCI'da DL'in gerçek tavanı" tartışmasında güçlü bir kanıt.
+
+**Dosya durumu**:
+
+- `experiments/exp_atcnet.py`: pre-norm + sığ TCN (67K param), final.
+- `results/oof/atcnet/sub_NN.npz`: 9 denek, hepsi pre-norm sürümünden.
+- `experiments/exp_ensemble.py`: BASE_DIRS'e `atcnet` eklendi, 4 yeni combo dahil
+  edildi (lider değişmedi).
+- **Final lider**: Faz 4–5a kombinasyonu, κ_CV=0.6553, A0XE test κ=0.6137.
+
+---
+
+## Faz 8 — S&R Augmentation Sanity (Negatif Sonuç)
+
+**Hedef**: ATCNet ablation sonucu DL kolunun veri kıtlığından çöktüğü hipotezini
+test etmek. S&R augmentation (Lotte 2014, Conformer 2022) ile her trial 4 segmente
+bölünüp aynı sınıftan trial'larla karıştırılarak 230 → ~1000 trial elde edilir.
+Hipotez: bu DL base'lerini rehabilite ederek ensemble κ'sını artırır.
+
+**Uygulama**:
+
+- `_dl_common.py`'ye `augment_mode` parametresi eklendi (`standard`/`sr`/`both`),
+  geri uyumlu. `_segmentation_reconstruction()` fonksiyonu modül seviyesinde.
+- `experiments/exp_eegnet_sr.py` ve `exp_shallowconvnet_sr.py`: vanilla
+  `build_model`'i import eden minimal wrapper'lar, `augment_mode="sr"`.
+- Sanity test stratejisi: A01 (güçlü, vanilla EEGNet κ=0.61) + A05 (illiterate,
+  vanilla κ=0.04) — uç deneklerde sinyal ararken her iki yönü tarama.
+
+**Sonuç**:
+
+| Base | A01 Δκ | A05 Δκ |
+|:--|:-:|:-:|
+| eegnet | −0.019 | −0.051 |
+| shallowconvnet | −0.005 | +0.051 |
+
+A01'de iki DL de negatif; A05'te DL'ler zıt yönde (ortalamada nötr). Mutlak
+değerler chance bölgesinde (A05 maksimum 0.097, hâlâ illiterate). Fold std'leri
+vanilla'ya göre artmış (A01 EEGNet vanilla std=0.07 → S&R std=0.13).
+
+**Yorum**:
+
+- S&R'ın yarattığı segment-sınırı artefaktları MI'nın faz-duyarlı ERD/ERS
+  paternlerini bozuyor olabilir.
+- A05 illiterate teşhisi sinyalde ayrımcı bilgi olmaması; S&R bu temel sorunu
+  çözmez (var olmayan bilgiyi yaratamaz).
+- ATCNet ablation + S&R sanity birleşimi: DL kolu bu protokolde (288 trial
+  subject-specific) fundamentally tıkalı. Veri çoğaltma çözüm değil.
+
+9 denek tam tur koşulmadı (sanity yetersizliği nedeniyle). **Pivot**: per-trial
+dynamic combination (confidence-weighted soft voting; makale Fikir 2 omurgası).
+
+**Dosyalar**:
+
+- `_dl_common.py` değişiklikleri kalır (gelecekte başka augmentation denenebilir).
+- `exp_eegnet_sr.py` ve `exp_shallowconvnet_sr.py` kalır (negatif sonuç
+  dökümantasyonu için).
+- Yeni OOF üretilmedi; mevcut vanilla OOF'lar korunmuş.
+
+---
+
+## Faz 9 — Dynamic Combination (Negatif Sonuç)
+
+**Hedef**: Statik soft voting her trial'a aynı global ağırlığı veriyor. Hibrit
+dinamik birleştirme her trial için base'lerin güven skoruna göre per-trial ağırlık
+ayarlasın — yeni model eğitimi yok, mevcut OOF'lar üstünde post-hoc analiz.
+
+**Uygulama** (`exp_ensemble.py`, `dynamic_soft_vote`):
+
+- Güven skoru: **negatif entropy** (yüksek = base o trial'da daha emin).
+- Per-trial ağırlık: `softmax(confidence / temperature)`, base'ler arası.
+- Final ağırlık: `global_weight × per_trial_weight` (normalize).
+- Temperature kontrolü: T→0 hard-selection (en emin base), T→∞ statik soft voting.
+- Kalibrasyon yok (ilk tur).
+
+**Test**: T ∈ {0.5, 1.0, 2.0, 5.0}, 4-base ve 5-base kombinasyonları.
+
+**Sonuç**:
+
+| Konfig | mean κ | weak κ | strong κ |
+|:--|:-:|:-:|:-:|
+| Static lider (referans) | **0.6553** | 0.4329 | 0.8333 |
+| Dynamic 4-base T=5.0 (en iyi) | 0.6507 | 0.4259 | 0.8306 |
+| Dynamic 4-base T=2.0 | 0.6502 | 0.4190 | 0.8352 |
+| Dynamic 4-base T=1.0 | 0.6487 | 0.4167 | 0.8343 |
+| Dynamic 4-base T=0.5 | 0.6440 | 0.4086 | 0.8324 |
+
+**Temperature etkisi**: 4-base ve 5-base'de monoton — **T arttıkça κ artıyor**
+(T=0.5 en kötü, T=5.0 en iyi). Optimal nokta T→∞, yani **statik'e yaklaşma**.
+
+**Per-subject (static vs dynamic T=2.0)**: strong deneklerde +0.009 (A03, A07),
+weak deneklerde −0.019 (A04, A06) — **hipotezin tam tersi**.
+
+**Bulgu**: Dynamic combination **kazanmadı**, hiçbir varyant 0.6553'ü geçmedi.
+Confidence (negatif entropy) bu sette **güvenilir ağırlık sinyali değil**: DL
+base'leri weak deneklerde **yüksek güvenle yanlış** tahmin yapıyor (düşük entropy ≠
+doğruluk). Dynamic bu overconfident-wrong tahminlere ağırlık verince weak grupta
+zarar veriyor. Temperature'ın T→∞ yönünde optimuma gitmesi "dinamik sinyalin değeri
+yok, ne kadar yok sayarsan o kadar iyi" demek.
+
+**Pivot**: klasik kolu güçlendirme — multi-scale Riemann (Faz 10).
+
+---
+
+## Faz 10 — Multi-scale Riemann (Negatif Sonuç)
+
+**Hedef**: Mevcut multi-band Riemannian'ın (frekans ekseni) zaman-eksenli karşıtını
+denemek; ensemble'a ortogonal 4./5. base aday.
+
+**Uygulama** (`_riemann_common.MultiScaleTangentSpace`, `exp_riemann_multiscale_ts.py`):
+
+- Tek geniş bant 8–30 Hz (multiband ile ortogonallik amaçlı).
+- 4 zaman penceresi: `[(0,500), (0,250), (250,500), (125,375)]` (full + early-half
+  + late-half + mid-half).
+- Her pencerede `Covariances('oas')` → `TangentSpace('riemann')` → concat →
+  StandardScaler → L1-LR (saga). OOF subdir `riemann_multiscale_ts_l1`.
+
+**A03 sanity** (güçlü denek, multiband L1 vanilla 0.8056):
+
+| Base | A03 κ |
+|:--|:-:|
+| riemann_multiband_ts_l1 (vanilla) | 0.8056 |
+| riemann_multiscale_ts_l1 | **0.7685** (Δ = −0.037) |
+
+**Karar**: Δκ = −0.037 < −0.03 eşiği → **multi-scale kötü, 9 denek koşulmadı**.
+Smoke artefaktları temizlendi.
+
+**Bulgu**: Multi-scale, güçlü denekte bile vanilla multiband'in altında.
+(1) 4 pencere × 253 = **1012 feature / 288 trial** — boyut/örnek oranı multiband'in
+759'undan daha kötü, L1 sıkıştıramıyor. (2) Tek 8–30 bant **frekans ayrımcılığını
+kaybetti** (multiband 3 bantla mu/beta'yı ayırıyordu); zaman pencereleri telafi
+etmedi. (3) Yarım pencereler tam pencerenin alt-kümesi — ortogonal bilgi yok, sadece
+daha gürültülü kovaryans.
+
+**Pivot**: çok-tohumlu (multi-seed) ortalama (Faz 11).
+
+---
+
+## Faz 11 — Multi-Seed Averaging (Mixed: bireysel ↑, ensemble nötr)
+
+**Hedef**: MAtt/ATCNet/CTNet paper'ları bu protokolde 10-seed averaging kullanıyor.
+Tek-seed varyansı +0.02–0.04 κ farkı yaratabilir; DL base'lerini rehabilite edip
+ensemble'a yansıyabilir mi?
+
+**Uygulama** (`_dl_common.run_dl_subject_multiseed`):
+
+- 10 seed (base 42–51), her seed için 5-fold OOF üret, **olasılık matrislerini
+  ortala** → argmax.
+- **KRİTİK bug fix**: `run_dl_subject`'i tekrar çağırmak işe yaramaz çünkü
+  `train_one_fold` içinde `inner_seed = RANDOM_STATE + fi` sabit; global `set_seed`'i
+  ezdiği için tüm seed'ler bit-bit aynı çıkardı. Çözüm: outer fold yapısını
+  (StratifiedKFold rs=42, ensemble hizalaması korunur) wrapper'da kurup
+  `train_one_fold`'a **seed-bağımlı** `inner_seed = RANDOM_STATE + s_idx*100 + fi`
+  geçmek. Böylece outer fold değişmez, sadece model init/dropout/augmentation
+  stokastisitesi seed başına değişir. (seed_idx 0 = vanilla ile birebir; doğrulandı.)
+- Wrapper'lar: `exp_eegnet_10seed.py`, `exp_shallowconvnet_10seed.py`,
+  `exp_atcnet_10seed.py`. OOF subdir'ler `*_10seed`. Süre: ~69/78/74 dk.
+
+**Bireysel sonuçlar (tek-seed → 10-seed)**:
+
+| Base | 1-seed | 10-seed | Δ mean | Δ weak |
+|:--|:-:|:-:|:-:|:-:|
+| EEGNet | 0.3976 | **0.4779** | **+0.080** | +0.118 |
+| ShallowConvNet | 0.3971 | **0.4352** | +0.038 | +0.056 |
+| ATCNet | 0.4064 | **0.4866** | **+0.080** | +0.138 |
+
+A02 tek başına +0.255 (EEGNet), A05 nihayet 0.04→0.17 (ATCNet) kıpırdadı. Alignment
+(fbcsp_rlda y_true ile) 9 denek için ✓.
+
+**Ensemble entegrasyonu** (ağırlık ablation, `exp_ensemble.py` Faz 11 combos):
+
+| Kombinasyon | mean κ |
+|:--|:-:|
+| Static lider (Faz 5a, single-seed) | **0.6553** |
+| Faz4 + EEGNet_10s + Shallow_10s (1/1/1.0/1.0) — en iyi 10s | 0.6487 |
+| Faz4 + 3 DL_10s (w=0.5) | 0.6471 |
+| Faz4 + 2 DL_10s (1/1/0.5/0.5) | 0.6430 |
+
+Ağırlık ablation: 2 DL_10s'te yüksek ağırlık iyi (w=1.0 → 0.6487), 3 DL_10s'te
+yüksek ağırlık kötü (w=1.0 → 0.6332). **Hiçbir 10-seed kombinasyonu lideri geçmedi.**
+
+**Bulgu** (makale için kritik): Multi-seed averaging **bireysel DL doğruluğunu
+ciddi artırdı** (+0.080) ama **ensemble'a yansımadı**. Sebep ensemble teorisiyle
+tutarlı: averaging DL tahminlerini "konsensüs"e çekiyor, kolay trial'larda
+klasiklerle aynılaşıyor → **ortogonal hata profili (Faz 5a Jaccard ~0.29) azalıyor**.
+Daha doğru ama daha az çeşitli base, soft-vote'a daha az katkı sağlıyor. Yani
+**"daha doğru base ⇏ daha iyi ensemble"** — çeşitlilik tek başına performanstan
+önemli. Ayrıca Faz 5a'daki "DL çöktü" sonucunun aslında **yüksek tek-seed varyansı**
+olduğu ortaya çıktı.
+
+**Final lider DEĞİŞMEDİ**: Faz 5a single-seed ensemble (FBCSP+sLDA + MB-TS-L1 +
+EEGNet + ShallowConvNet, 1/1/0.5/0.5), **κ_CV=0.6553 / A0XE test κ=0.6137**.
+
+---
+
+## Kümülatif Negatif/Nötr Ablasyon Özeti (Faz 7–11)
+
+| Faz | Yöntem | Sonuç | Lider'i geçti mi? |
+|:-:|:--|:-:|:-:|
+| 7 | ATCNet (modern attention mimari) | 0.406 birey / 0.6528 ens. | Hayır |
+| 8 | S&R augmentation | A01/A05 sanity negatif | Koşulmadı |
+| 9 | Dynamic combination (confidence) | 0.6507 (T=5) | Hayır |
+| 10 | Multi-scale Riemann | A03 0.769 < 0.806 | Koşulmadı |
+| 11 | Multi-seed averaging | birey +0.080, ens. 0.6487 | Hayır |
+
+**Sonuç**: Beş ileri yöntemin hiçbiri sızıntısız protokolde temel topluluğu
+(κ_CV=0.6553) geçemedi. κ ≈ 0.61 (A0XE test) bu katı değerlendirme rejiminde
+gerçekçi bir üst banda karşılık geliyor.
+
+---
+
+*Son güncelleme: 2026-06-09 (Faz 9–11 eklendi: dynamic combination, multi-scale Riemann, multi-seed averaging — hepsi lideri geçemedi; final lider κ_CV=0.6553 / A0XE test κ=0.6137)*

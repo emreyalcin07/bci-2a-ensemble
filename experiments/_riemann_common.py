@@ -236,10 +236,59 @@ class MultiBandTangentSpace(BaseEstimator, TransformerMixin):
         return np.concatenate(feats, axis=1).astype(np.float32, copy=False)
 
 
+# --------------------------------------------------------------------------- #
+# Multi-scale Tangent Space transformer (Faz 9 — zaman pencereleri)           #
+# --------------------------------------------------------------------------- #
+
+
+class MultiScaleTangentSpace(BaseEstimator, TransformerMixin):
+    """Single-band, multi-scale Tangent Space.
+
+    Input: (n_trials, n_channels, n_samples) — single bandpass uygulanmis.
+    Her time window icin Cov + TS hesaplanir, feature'lar concat edilir.
+
+    Modul seviyesinde tanimlandi (MultiBandTangentSpace gibi) — joblib.Memory
+    pickle icin sinifi modul yolundan bulmak zorunda.
+
+    Args:
+        windows: list of (start, end) tuples — orn. [(0,500),(0,250),...]
+        cov_estimator: 'oas' (default), 'lwf', 'cov'
+        metric: 'riemann' (default)
+    """
+
+    def __init__(self, windows, cov_estimator="oas", metric="riemann"):
+        self.windows = windows
+        self.cov_estimator = cov_estimator
+        self.metric = metric
+
+    def fit(self, X, y=None):
+        from pyriemann.estimation import Covariances
+        from pyriemann.tangentspace import TangentSpace
+
+        self.ts_per_window_ = []
+        for (start, end) in self.windows:
+            X_win = X[:, :, start:end].astype(np.float64, copy=False)
+            cov = Covariances(estimator=self.cov_estimator).fit_transform(X_win)
+            ts = TangentSpace(metric=self.metric).fit(cov)
+            self.ts_per_window_.append(ts)
+        return self
+
+    def transform(self, X):
+        from pyriemann.estimation import Covariances
+
+        feats = []
+        for (start, end), ts in zip(self.windows, self.ts_per_window_):
+            X_win = X[:, :, start:end].astype(np.float64, copy=False)
+            cov = Covariances(estimator=self.cov_estimator).fit_transform(X_win)
+            feats.append(ts.transform(cov))
+        return np.concatenate(feats, axis=1).astype(np.float32, copy=False)
+
+
 __all__ = [
     "RANDOM_STATE",
     "SubjectRunResult",
     "MultiBandTangentSpace",
+    "MultiScaleTangentSpace",
     "bandpass_single",
     "bandpass_multi",
     "report_and_save",
