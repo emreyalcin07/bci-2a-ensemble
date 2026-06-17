@@ -1,4 +1,4 @@
-# bci-2a-ensemble — EEG Sinyali Sınıflandırması
+# Motor Imagery EEG Sınıflandırma (BCI Competition IV Dataset 2a)
 
 **BCI Competition IV — Dataset 2a** üzerinde, denek-özel (subject-specific) **motor imagery** EEG
 sınıflandırması. Hedef, hiçbir bilgi sızıntısı olmadan (dürüst nested CV) mümkün olan en yüksek
